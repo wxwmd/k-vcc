@@ -5,7 +5,8 @@ from networkx.algorithms.connectivity import cuts
 from networkx.algorithms.traversal.breadth_first_search import bfs_edges
 from networkx.algorithms.flow import maximum_flow_value
 from networkx.classes.function import common_neighbors
-from networkx.algorithms.shortest_paths.generic import shortest_path_length
+from networkx.algorithms.shortest_paths.unweighted import single_source_shortest_path_length
+from networkx import k_core
 
 
 def directed_flow_graph(g: nx.Graph) -> nx.DiGraph:
@@ -146,11 +147,11 @@ def kvcc_enum(g: nx.Graph, k) -> list:
     :return: set，里面的每一个元素是set，每个set表示一个k-vcc的点集
     """
     vcc = []
-    remove_nodes = [node for node in g.nodes if g.degree[node] < k]
-    g.remove_nodes_from(remove_nodes)
-    components = nx.connected_components(g)
+    # 生成k-core
+    g_core = k_core(g,k)
+    components = nx.connected_components(g_core)
     for component in components:
-        component_g = g.subgraph(component).copy()
+        component_g = g_core.subgraph(component).copy()
         cut = global_cut_optimization(component_g, k)
         if cut is None:
             vcc.append(component)
@@ -158,6 +159,12 @@ def kvcc_enum(g: nx.Graph, k) -> list:
             sub_components = overlap_partition(component_g, cut)
             for sub_component in sub_components:
                 sub_component_g = component_g.subgraph(sub_component).copy()
+                # 对于那些是cut中的点或者有邻居在cut中的点，他们的side-vertex状态可能发生了改变，重新计算一遍
+                for u in cut:
+                    recompute_strong_side_vertex(sub_component_g, k, u)
+                    for neighbor in list(sub_component_g.adj[u].keys()):
+                        recompute_strong_side_vertex(sub_component_g, k, neighbor)
+
                 vcc = vcc + kvcc_enum(sub_component_g, k)
     return vcc
 
@@ -181,7 +188,7 @@ def strong_side_vertices(g: nx.Graph, k):
     :param k:
     :return:
     """
-    side_vettices = set()
+    side_vertices = set()
     for u in g.nodes:
         flag = True
         neighbors = list(g.adj[u].keys())
@@ -196,8 +203,58 @@ def strong_side_vertices(g: nx.Graph, k):
                 break
         g.nodes[u]['side_vertex'] = flag
         if flag:
-            side_vettices.add(u)
-    return side_vettices
+            side_vertices.add(u)
+    return side_vertices
+
+
+def recompute_strong_side_vertex(g: nx.Graph, k, u):
+    """
+    u的side-vertex状态可能发生了改变，再次计算一遍u的side-vertex状态
+    在使用点割S分割产生新的子图g的时候，u的邻居Nu和S有了交集，所以需要对u是不是strong_side_vertex再进行一次确认
+    :param g:新产生的子图
+    :param k:k
+    :param u:需要重新计算的点
+    :return:None
+    """
+    if not g.nodes[u]['side_vertex']:
+        return
+    neighbors = list(g.adj[u].keys())
+    flag = True
+    for v in neighbors:
+        for v1 in neighbors:
+            if v == v1 or g.has_edge(v, v1) or len(list(common_neighbors(g, v, v1))) >= k:
+                continue
+            else:
+                flag = False
+                g.nodes[u]['side_vertex'] = False
+                break
+        if not flag:
+            break
+
+
+def select_u(g: nx.Graph):
+    """
+    选取global_cut_optimization（）中的节点u
+
+    如果g中有strong-side-vertex，选取度最大的哪个strong-side-vertex
+    如果g中没有strong-side-vertex，选取度最小的哪个节点
+    :param g:
+    :return:u
+    """
+    u = -1
+    strong_flag = False
+    for node in g.nodes:
+        if u == -1:
+            u = node
+        elif g.nodes[node]['side_vertex']:
+            if not strong_flag:
+                strong_flag = True
+                u = node
+            elif strong_flag and g.degree[node] > g.degree[u]:
+                u = node
+        elif (not strong_flag) and g.degree[node] < g.degree[u]:
+            u = node
+    return u
 
 
 def global_cut_optimization(g: nx.Graph, k):
@@ -209,28 +266,25 @@ def global_cut_optimization(g: nx.Graph, k):
     """
     sc, cs = sparse_certificate(g, k)
     flow_sc = directed_flow_graph(sc)
-    side_vertices = strong_side_vertices(sc, k)
-    u = 0
-    if len(side_vertices) == 0:
-        min_degree = min([x[1] for x in list(sc.degree)])
-        for node in g.nodes:
-            if sc.degree[node] == min_degree:
-                u = node
-    else:
-        u = side_vertices.pop()
+    u=select_u(sc)
 
     for v in sc.nodes:
         sc.nodes[v]['pru'] = False
-        sc.nodes[v]['deposit']=0
-    sweep(u, cs, sc, k)
+        sc.nodes[v]['deposit'] = 0
+    sc.nodes[u]['pru']=True
+    for v in sc.neighbors(u):
+        sweep(v,cs,sc,k)
 
-    dist = [v for v in sc.nodes]
-    dist.sort(key=lambda v: shortest_path_length(sc, u, v), reverse=True)
+    # u与更远的v之间更有可能出现点切，所以我们按照距离由远到近来遍历
+    nodes = [v for v in sc.nodes]
+    dist = single_source_shortest_path_length(sc, u)
+    nodes.sort(key=lambda v: dist[v], reverse=True)
 
-    for v in dist:
+    for v in nodes:
         if sc.nodes[v]['pru']:
             continue
         else:
+            print('搜索v:', v)
             cut = local_cut(u, v, flow_sc, sc, k)
             if cut:
                 return cut
@@ -246,6 +300,8 @@ def sweep(v, cs: list, g: nx.Graph, k):
     :param cs: SideGroup的信息.
     :return:None
     """
+    if g.nodes[v]['pru']:
+        return
     g.nodes[v]['pru'] = True
     for w in list(g.adj[v].keys()):
         if not g.nodes[w]['pru']:
@@ -261,3 +317,4 @@ def sweep(v, cs: list, g: nx.Graph, k):
                 for w in cs[cc].vertex:
                     if not g.nodes[w]['pru']:
                         sweep(w, cs, g, k)
+
